@@ -1,3 +1,4 @@
+
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <cmath>
@@ -18,6 +19,7 @@
 #define MAX_LOG_LINES 2000
 #define SIMULATE_FLOW 0
 #define WATER_LEVEL_SENSOR_HEIGHT 50
+#define FLOW_PULSE_NORMALIZATION 100.0f
 
 const char* ssid = "";
 const char* password = "";
@@ -41,7 +43,7 @@ KMeans kmeans(3, 100, 1e-4f);
 struct SensorLog {
   time_t timestamp;
   int waterLevel;
-  int flow;
+  int flowPulses;
 };
 
 std::vector<SensorLog> sensorLogs;
@@ -58,9 +60,10 @@ void IRAM_ATTR countPulse() {
   pulseCount++;
 }
 
-std::vector<float> normalizeSample(int waterLevel, int flow) {
+std::vector<float> normalizeSample(int waterLevel, int flowPulses) {
   float normalizedWater = (float)waterLevel / (float)(BOTTOM_MARGIN_MM + WATER_LEVEL_SENSOR_HEIGHT);
-  float normalizedFlow = flow / 20.0f;
+  float normalizedFlow = (float)flowPulses / FLOW_PULSE_NORMALIZATION;
+
   return { normalizedWater, normalizedFlow };
 }
 
@@ -111,12 +114,12 @@ void loop() {
 
   time_t epochTime = getTime();
   int waterLevel = getWaterLevel();
-  int flowRaw = getWaterFlow();
+  int flowPulses = getWaterFlow();
 
-  sendAlert(waterLevel, flowRaw);
-  logToMemory(epochTime, waterLevel, flowRaw);
+  sendAlert(waterLevel, flowPulses);
+  logToMemory(epochTime, waterLevel, flowPulses);
   mqttPublishResources();
-  mqttPublishTelemetry(epochTime, waterLevel, flowRaw);
+  mqttPublishTelemetry(epochTime, waterLevel, flowPulses);
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -173,7 +176,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
       const SensorLog& log = sensorLogs[i];
 
-      String line = String((long)log.timestamp) + "," + String(log.waterLevel) + "," + String(log.flow) + "\n";
+      String line = String((long)log.timestamp) + "," + String(log.waterLevel) + "," + String(log.flowPulses) + "\n";
 
       if (startWrapper.length() + payloadStr.length() + line.length() + metadataOverhead > LOG_BUFFER_SIZE) {
         hasMore = true;
@@ -205,12 +208,12 @@ void mqttPublishResources() {
   Serial.println(payload);
 }
 
-void mqttPublishTelemetry(time_t epochTime, int waterLevel, int flow) {
+void mqttPublishTelemetry(time_t epochTime, int waterLevel, int flowPulses) {
   if (!client.connected()) {
     mqttReconnect();
   }
 
-  String payloadStr = "{ \"timestamp\": " + String(epochTime) + ", \"water_level_mm\": " + String(waterLevel) + ", \"flow_lpm\": " + String(flow) + " }";
+  String payloadStr = "{ \"timestamp\": " + String(epochTime) + ", \"water_level_mm\": " + String(waterLevel) + ", \"flow_pulses\": " + String(flowPulses) + " }";
 
   const uint8_t* payload = (uint8_t*)payloadStr.c_str();
 
@@ -249,8 +252,29 @@ bool getAiToggleValue() {
 
 int getWaterFlow() {
 #if SIMULATE_FLOW
-  int raw = analogRead(PIN_FLOW_SENSOR);
-  return (int)((raw / 4095.0f) * 20.0f);
+  static unsigned long lastSimulationMillis = 0;
+  static uint32_t simulatedPulses = 0;
+
+  unsigned long currentMillis = millis();
+  unsigned long elapsedMillis = currentMillis - lastSimulationMillis;
+
+  if (elapsedMillis == 0) {
+    return 0;
+  }
+
+  // Simulate raw pulses per second
+  float pulsesPerSecond = 25.0f;
+
+  simulatedPulses += (uint32_t)roundf(
+    pulsesPerSecond * elapsedMillis / 1000.0f
+  );
+
+  lastSimulationMillis = currentMillis;
+
+  uint32_t pulses = simulatedPulses;
+  simulatedPulses = 0;
+
+  return (int)pulses;
 #else
   unsigned long currentMillis = millis();
   unsigned long elapsedMillis = currentMillis - previousFlowMillis;
@@ -266,9 +290,7 @@ int getWaterFlow() {
 
   previousFlowMillis = currentMillis;
 
-  float frequency = (pulses * 1000.0f) / elapsedMillis;
-  float flow = (frequency * 60.0f) / 450.0f;
-  return (int)roundf(flow);
+  return (int)pulses;
 #endif
 }
 
@@ -288,22 +310,23 @@ time_t getTime() {
   return 0;
 }
 
-void logToMemory(time_t epochTime, int waterLevel, int flow) {
+void logToMemory(time_t epochTime, int waterLevel, int flowPulses) {
   if (sensorLogs.size() >= MAX_LOG_LINES) {
     sensorLogs.erase(sensorLogs.begin());
   }
 
-  sensorLogs.push_back({ epochTime, waterLevel, flow });
+  sensorLogs.push_back({ epochTime, waterLevel, flowPulses });
 
-  Serial.printf("[LOG] Timestamp: %ld | Water Level: %d | Flow: %d L/min\n", (long)epochTime, waterLevel, flow);
+  Serial.printf("[LOG] Timestamp: %ld | Water Level: %d | Flow Pulses: %d\n",
+                (long)epochTime, waterLevel, flowPulses);
 }
 
-void sendAlert(int waterLevel, int flowRaw) {
+void sendAlert(int waterLevel, int flowPulses) {
   if (!getAiToggleValue()) {
     return;
   }
 
-  std::vector<float> sample = normalizeSample((float)waterLevel, (float)flowRaw);
+  std::vector<float> sample = normalizeSample((float)waterLevel, (float)flowPulses);
   int cluster = kmeans.predict(sample);
 
   if (cluster < 0) {
@@ -343,7 +366,8 @@ void applyTraining() {
   time_t startEpoch = (time_t)trainingStart;
   time_t endEpoch = (time_t)trainingEnd;
 
-  Serial.printf("[KMEANS] Training window: %lld to %lld\n", (long long)startEpoch, (long long)endEpoch);
+  Serial.printf("[KMEANS] Training window: %lld to %lld\n",
+                (long long)startEpoch, (long long)endEpoch);
 
   trainFromLog(startEpoch, endEpoch);
 }
@@ -354,7 +378,7 @@ void trainFromLog(time_t startEpoch, time_t endEpoch) {
   for (const auto& log : sensorLogs) {
     if (log.timestamp >= startEpoch && log.timestamp <= endEpoch) {
       if (dataset.size() < MAX_TRAINING_LINES) {
-        dataset.push_back(normalizeSample((float)log.waterLevel, (float)log.flow));
+        dataset.push_back(normalizeSample((float)log.waterLevel, (float)log.flowPulses));
       }
     }
   }
@@ -365,36 +389,37 @@ void trainFromLog(time_t startEpoch, time_t endEpoch) {
   }
 
   kmeans.train(dataset);
-  Serial.printf("[KMEANS] Trained successfully on %d samples ([Water Level, Flow]).\n", (int)dataset.size());
+  Serial.printf("[KMEANS] Trained successfully on %d samples ([Water Level, Flow Pulses]).\n",
+                (int)dataset.size());
 }
 
 void trainFromSampleDataset() {
   std::vector<std::vector<float>> dataset = {
-    // Normal operating conditions (110mm to 130mm range)
-    normalizeSample(112, 2),
-    normalizeSample(115, 3),
-    normalizeSample(118, 3),
-    normalizeSample(120, 4),
-    normalizeSample(123, 4),
-    normalizeSample(125, 5),
-    normalizeSample(128, 5),
-    normalizeSample(130, 6),
-    normalizeSample(132, 6),
+    // Normal operating conditions
+    normalizeSample(112, 75),
+    normalizeSample(115, 112),
+    normalizeSample(118, 112),
+    normalizeSample(120, 150),
+    normalizeSample(123, 150),
+    normalizeSample(125, 187),
+    normalizeSample(128, 187),
+    normalizeSample(130, 225),
+    normalizeSample(132, 225),
 
-    // Mid operating conditions (133mm to 145mm range)
-    normalizeSample(135, 8),
-    normalizeSample(138, 9),
-    normalizeSample(140, 9),
-    normalizeSample(142, 10),
-    normalizeSample(145, 10),
-    normalizeSample(148, 11),
+    // Mid operating conditions
+    normalizeSample(135, 300),
+    normalizeSample(138, 337),
+    normalizeSample(140, 337),
+    normalizeSample(142, 375),
+    normalizeSample(145, 375),
+    normalizeSample(148, 412),
 
-    // Higher operating conditions (150mm to 160mm range)
-    normalizeSample(150, 13),
-    normalizeSample(153, 14),
-    normalizeSample(155, 15),
-    normalizeSample(158, 16),
-    normalizeSample(160, 17)
+    // Higher operating conditions
+    normalizeSample(150, 487),
+    normalizeSample(153, 525),
+    normalizeSample(155, 562),
+    normalizeSample(158, 600),
+    normalizeSample(160, 637)
   };
 
   kmeans.train(dataset);
@@ -403,3 +428,4 @@ void trainFromSampleDataset() {
     "[KMEANS] Embedded dataset training completed: %d samples.\n",
     (int)dataset.size());
 }
+
