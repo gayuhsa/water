@@ -6,9 +6,9 @@
 #include <vector>
 #include "KMeans.h"
 
-#define PIN_WATER_LEVEL 21
-#define PIN_BUZZER 0
-#define PIN_FLOW_SENSOR 23
+#define PIN_WATER_LEVEL 32
+#define BUZZER_GPIO 14
+#define PIN_FLOW_SENSOR 33
 
 #define ANOMALY_THRESHOLD 0.1f
 #define BOTTOM_MARGIN_MM 110
@@ -69,14 +69,15 @@ void setup() {
 
 #if !SIMULATE_FLOW
   previousFlowMillis = millis();
-  pinMode(PIN_FLOW_SENSOR, INPUT);
+  pinMode(PIN_FLOW_SENSOR, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_FLOW_SENSOR), countPulse, FALLING);
 #endif
 
   pinMode(PIN_WATER_LEVEL, INPUT);
-  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(BUZZER_GPIO, OUTPUT);
 
   analogReadResolution(12);
+  analogSetPinAttenuation(PIN_WATER_LEVEL, ADC_11db);
   trainFromSampleDataset();
 
   Serial.print("[WIFI] Connecting to WiFi");
@@ -315,7 +316,7 @@ void sendAlert(int waterLevel, int flowRaw) {
 
   if (distToCenter > ANOMALY_THRESHOLD) {
     Serial.println("[ALERT] Anomaly detected!");
-    tone(PIN_BUZZER, 1000, 1000);
+    tone(BUZZER_GPIO, 1000, 1000);
   }
 }
 
@@ -369,7 +370,7 @@ void trainFromLog(time_t startEpoch, time_t endEpoch) {
 
 void trainFromSampleDataset() {
   std::vector<std::vector<float>> dataset = {
-// Normal operating conditions (110mm to 130mm range)
+    // Normal operating conditions (110mm to 130mm range)
     normalizeSample(112, 2),
     normalizeSample(115, 3),
     normalizeSample(118, 3),
@@ -402,4 +403,3 @@ void trainFromSampleDataset() {
     "[KMEANS] Embedded dataset training completed: %d samples.\n",
     (int)dataset.size());
 }
-
